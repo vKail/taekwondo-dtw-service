@@ -24,7 +24,6 @@ def calculate_torso_length(first_frame_nodes: dict) -> float:
         return 1.0
 
 def extract_yaw_from_quat(quat_dict: dict) -> float:
-    """Extrae el ángulo Yaw (rotación en eje Z) del cuaternión en radianes."""
     x = quat_dict.get("x", 0.0)
     y = quat_dict.get("y", 0.0)
     z = quat_dict.get("z", 0.0)
@@ -36,13 +35,13 @@ def extract_yaw_from_quat(quat_dict: dict) -> float:
     return euler[0] 
 
 def calculate_spatial_alignment(student_frames, master_frames) -> R:
-    """Calcula la matriz de rotación en Z para alinear el alumno con el maestro."""
+    """Calcula la matriz de rotación en Z usando la PELVIS como origen direccional."""
     try:
-        u_head_0 = student_frames[0].get("trackers", student_frames[0].get("bones", {})).get("head", {})
-        m_head_0 = master_frames[0].get("trackers", master_frames[0].get("bones", {})).get("head", {})
+        u_pelvis_0 = student_frames[0].get("trackers", student_frames[0].get("bones", {})).get("pelvis", {})
+        m_pelvis_0 = master_frames[0].get("trackers", master_frames[0].get("bones", {})).get("pelvis", {})
         
-        uq = u_head_0.get("rotation_quat", u_head_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-        mq = m_head_0.get("rotation_quat", m_head_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
+        uq = u_pelvis_0.get("rotation_quat", u_pelvis_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
+        mq = m_pelvis_0.get("rotation_quat", m_pelvis_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
         
         u_yaw = extract_yaw_from_quat(uq)
         m_yaw = extract_yaw_from_quat(mq)
@@ -52,29 +51,43 @@ def calculate_spatial_alignment(student_frames, master_frames) -> R:
     except Exception:
         return R.from_euler('z', 0, degrees=False)
 
-def unwrap_euler_series(euler_series: list) -> np.ndarray:
-    arr = np.array(euler_series)
-    arr_rad = np.deg2rad(arr)
-    arr_rad_unwrapped = np.unwrap(arr_rad, axis=0)
-    return np.rad2deg(arr_rad_unwrapped)
+def quat_angular_distance(q1, q2):
+    """
+    Calcula la distancia angular más corta en grados absolutos entre dos cuaterniones.
+    Evita el 'Aliasing' y el 'Gimbal Lock' de los Ángulos de Euler.
+    """
+    dot_product = np.dot(q1, q2)
+    dot_product = np.clip(np.abs(dot_product), 0.0, 1.0)
+    return np.degrees(2 * np.arccos(dot_product))
 
 def extract_nodes(frame: dict) -> dict:
     return frame.get("trackers", frame.get("bones", {}))
 
 def get_joint_keys_for_movement(movement_type: str) -> list:
+    """Excluimos la cabeza de la evaluación por ser irrelevante biomecánicamente en Taekwondo."""
     mov = movement_type.lower()
     if mov == "jirugi":
-        return ["head", "hand_r", "hand_l"]
+        return ["hand_r", "hand_l"]
     elif mov in ["ap_chagi", "dollyo_chagi", "yop_chagi", "chagi"]:
-        return ["head", "foot_r", "foot_l"]
+        return ["foot_r", "foot_l"]
     else:
-        return ["head", "hand_r", "hand_l", "foot_r", "foot_l"]
+        return ["hand_r", "hand_l", "foot_r", "foot_l"]
 
-def find_worst_moment(master_series, student_series, path):
+def find_worst_moment_pos(master_series, student_series, path):
     max_d = -1.0
     worst_student_idx = 0
     for i, j in path:
         d = euclidean(master_series[i], student_series[j])
+        if d > max_d:
+            max_d = d
+            worst_student_idx = j
+    return worst_student_idx
+
+def find_worst_moment_rot(master_series, student_series, path):
+    max_d = -1.0
+    worst_student_idx = 0
+    for i, j in path:
+        d = quat_angular_distance(master_series[i], student_series[j])
         if d > max_d:
             max_d = d
             worst_student_idx = j
@@ -95,7 +108,7 @@ def evaluate_movement(payload: EvaluationRequest):
         scale_user = calculate_torso_length(u_nodes_0)
         scale_master = calculate_torso_length(m_nodes_0)
         
-        # Alineación Geométrica de Coordenadas de Mundo
+        # Alineación Geométrica basada en la Pelvis
         alignment_rot = calculate_spatial_alignment(user_frames, master_frames)
 
         joint_keys = get_joint_keys_for_movement(payload.movement_type)
@@ -127,7 +140,7 @@ def evaluate_movement(payload: EvaluationRequest):
                 # Alinear la rotación de la articulación con el mundo
                 u_quat = R.from_quat([uq.get("x",0), uq.get("y",0), uq.get("z",0), qw])
                 aligned_u_quat = alignment_rot * u_quat
-                student_rot_series.append(aligned_u_quat.as_euler('xyz', degrees=True))
+                student_rot_series.append(aligned_u_quat.as_quat()) # Usamos as_quat, que devuelve numpy array [x,y,z,w]
 
             for m_frame in master_frames:
                 m_nodes = extract_nodes(m_frame)
@@ -141,17 +154,16 @@ def evaluate_movement(payload: EvaluationRequest):
                 mq = m_nodes[joint].get("rotation_quat", m_nodes[joint].get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
                 qw = mq.get("w", 1.0)
                 if mq.get("x",0) == 0 and mq.get("y",0) == 0 and mq.get("z",0) == 0 and qw == 0: qw = 1.0
+                
                 m_quat = R.from_quat([mq.get("x",0), mq.get("y",0), mq.get("z",0), qw])
-                master_rot_series.append(m_quat.as_euler('xyz', degrees=True))
+                master_rot_series.append(m_quat.as_quat())
 
             if not student_pos_series or not master_pos_series:
                 continue
 
-            student_rot_series = unwrap_euler_series(student_rot_series)
-            master_rot_series = unwrap_euler_series(master_rot_series)
-
+            # Ya NO usamos euler unwrap. DTW puro con cuaterniones.
             dist_pos, path_pos = fastdtw(master_pos_series, student_pos_series, dist=euclidean)
-            dist_rot, path_rot = fastdtw(master_rot_series, student_rot_series, dist=euclidean)
+            dist_rot, path_rot = fastdtw(master_rot_series, student_rot_series, dist=quat_angular_distance)
             
             joint_metrics[joint] = {
                 "pos_error": dist_pos / len(path_pos),
@@ -168,7 +180,7 @@ def evaluate_movement(payload: EvaluationRequest):
             raise HTTPException(status_code=400, detail="No se encontraron articulaciones válidas para comparar.")
 
         # UMBRALES DE TOLERANCIA
-        ROT_THRESHOLD = 15.0 
+        ROT_THRESHOLD = 20.0 # 20 Grados de rotación absoluta pura
         POS_THRESHOLD = 0.15 
         
         joints_analysis = {}
@@ -184,10 +196,10 @@ def evaluate_movement(payload: EvaluationRequest):
             
             if r_sev > p_sev:
                 failure_type = "rotación" if not passed else "ninguno"
-                worst_idx = find_worst_moment(metrics["master_rot_series"], metrics["student_rot_series"], metrics["path_rot"])
+                worst_idx = find_worst_moment_rot(metrics["master_rot_series"], metrics["student_rot_series"], metrics["path_rot"])
             else:
                 failure_type = "trayectoria" if not passed else "ninguno"
-                worst_idx = find_worst_moment(metrics["master_pos_series"], metrics["student_pos_series"], metrics["path_pos"])
+                worst_idx = find_worst_moment_pos(metrics["master_pos_series"], metrics["student_pos_series"], metrics["path_pos"])
                 
             frame_data = user_frames[worst_idx]
             frame_num = frame_data.get("frame", worst_idx)
@@ -213,7 +225,7 @@ def evaluate_movement(payload: EvaluationRequest):
         
         # GENERACIÓN DEL TEXTO COMPUESTO
         traduccion = {
-            "head": "la cabeza", "hand_r": "la mano derecha", "hand_l": "la mano izquierda", 
+            "hand_r": "la mano derecha", "hand_l": "la mano izquierda", 
             "foot_r": "el pie derecho", "foot_l": "el pie izquierdo"
         }
         
