@@ -13,9 +13,6 @@ class EvaluationRequest(BaseModel):
     movement_type: str   
 
 def calculate_torso_length(first_frame_nodes: dict) -> float:
-    """
-    Calcula la longitud del torso usando la distancia euclidiana entre la cabeza y la pelvis.
-    """
     try:
         h0 = first_frame_nodes.get("head", {}).get("position", {"x":0,"y":0,"z":0})
         p0 = first_frame_nodes.get("pelvis", {}).get("position", {"x":0,"y":0,"z":0})
@@ -26,23 +23,36 @@ def calculate_torso_length(first_frame_nodes: dict) -> float:
     except Exception:
         return 1.0
 
-def normalize_quaternion_to_euler(quat_dict: dict) -> np.ndarray:
-    """
-    Convierte cuaterniones del diccionario a Ángulos de Euler (Roll, Pitch, Yaw) en grados.
-    """
+def extract_yaw_from_quat(quat_dict: dict) -> float:
+    """Extrae el ángulo Yaw (rotación en eje Z) del cuaternión en radianes."""
     x = quat_dict.get("x", 0.0)
     y = quat_dict.get("y", 0.0)
     z = quat_dict.get("z", 0.0)
     w = quat_dict.get("w", 1.0)
     if x == 0 and y == 0 and z == 0 and w == 0:
         w = 1.0
-    rotation = R.from_quat([x, y, z, w])
-    return rotation.as_euler('xyz', degrees=True)
+    r = R.from_quat([x, y, z, w])
+    euler = r.as_euler('zyx', degrees=False)
+    return euler[0] 
+
+def calculate_spatial_alignment(student_frames, master_frames) -> R:
+    """Calcula la matriz de rotación en Z para alinear el alumno con el maestro."""
+    try:
+        u_head_0 = student_frames[0].get("trackers", student_frames[0].get("bones", {})).get("head", {})
+        m_head_0 = master_frames[0].get("trackers", master_frames[0].get("bones", {})).get("head", {})
+        
+        uq = u_head_0.get("rotation_quat", u_head_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
+        mq = m_head_0.get("rotation_quat", m_head_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
+        
+        u_yaw = extract_yaw_from_quat(uq)
+        m_yaw = extract_yaw_from_quat(mq)
+        
+        delta_yaw = m_yaw - u_yaw
+        return R.from_euler('z', delta_yaw, degrees=False)
+    except Exception:
+        return R.from_euler('z', 0, degrees=False)
 
 def unwrap_euler_series(euler_series: list) -> np.ndarray:
-    """
-    Aplica np.unwrap a una serie de ángulos de Euler para evitar saltos de 360 grados (Gimbal Lock).
-    """
     arr = np.array(euler_series)
     arr_rad = np.deg2rad(arr)
     arr_rad_unwrapped = np.unwrap(arr_rad, axis=0)
@@ -52,11 +62,6 @@ def extract_nodes(frame: dict) -> dict:
     return frame.get("trackers", frame.get("bones", {}))
 
 def get_joint_keys_for_movement(movement_type: str) -> list:
-    """
-    Devuelve estrictamente las articulaciones clave basadas en el JSON proporcionado.
-    El JSON analizado solo contiene: head, pelvis, hand_r, hand_l, foot_r, foot_l.
-    Excluimos 'pelvis' porque en el JSON actúa como el origen estático.
-    """
     mov = movement_type.lower()
     if mov == "jirugi":
         return ["head", "hand_r", "hand_l"]
@@ -66,10 +71,6 @@ def get_joint_keys_for_movement(movement_type: str) -> list:
         return ["head", "hand_r", "hand_l", "foot_r", "foot_l"]
 
 def find_worst_moment(master_series, student_series, path):
-    """
-    Itera sobre el camino de alineación DTW y encuentra el índice del alumno (j)
-    donde ocurrió la mayor distancia euclidiana frente al maestro.
-    """
     max_d = -1.0
     worst_student_idx = 0
     for i, j in path:
@@ -88,15 +89,16 @@ def evaluate_movement(payload: EvaluationRequest):
         if not user_frames or not master_frames:
             raise HTTPException(status_code=400, detail="Los datos deben contener 'frames'.")
 
-        # 1. FACTORES DE ESCALA INDEPENDIENTES
         u_nodes_0 = extract_nodes(user_frames[0])
         m_nodes_0 = extract_nodes(master_frames[0])
         
         scale_user = calculate_torso_length(u_nodes_0)
         scale_master = calculate_torso_length(m_nodes_0)
+        
+        # Alineación Geométrica de Coordenadas de Mundo
+        alignment_rot = calculate_spatial_alignment(user_frames, master_frames)
 
         joint_keys = get_joint_keys_for_movement(payload.movement_type)
-
         joint_metrics = {}
 
         for joint in joint_keys:
@@ -110,41 +112,50 @@ def evaluate_movement(payload: EvaluationRequest):
                 if joint not in u_nodes: continue
                 
                 up = u_nodes[joint].get("position", {"x":0,"y":0,"z":0})
-                u_pos = np.array([up["x"], up["y"], up["z"]]) / scale_user
-                student_pos_series.append(u_pos)
+                u_pelvis = u_nodes.get("pelvis", {}).get("position", {"x":0,"y":0,"z":0})
+                
+                # Centrado en la pelvis
+                u_pos_centered = np.array([up["x"] - u_pelvis["x"], up["y"] - u_pelvis["y"], up["z"] - u_pelvis["z"]])
+                # Alineación Z y Escala
+                u_pos_aligned = alignment_rot.apply(u_pos_centered)
+                student_pos_series.append(u_pos_aligned / scale_user)
 
                 uq = u_nodes[joint].get("rotation_quat", u_nodes[joint].get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-                student_rot_series.append(normalize_quaternion_to_euler(uq))
+                qw = uq.get("w", 1.0)
+                if uq.get("x",0) == 0 and uq.get("y",0) == 0 and uq.get("z",0) == 0 and qw == 0: qw = 1.0
+                
+                # Alinear la rotación de la articulación con el mundo
+                u_quat = R.from_quat([uq.get("x",0), uq.get("y",0), uq.get("z",0), qw])
+                aligned_u_quat = alignment_rot * u_quat
+                student_rot_series.append(aligned_u_quat.as_euler('xyz', degrees=True))
 
             for m_frame in master_frames:
                 m_nodes = extract_nodes(m_frame)
                 if joint not in m_nodes: continue
 
                 mp = m_nodes[joint].get("position", {"x":0,"y":0,"z":0})
-                m_pos = np.array([mp["x"], mp["y"], mp["z"]]) / scale_master
-                master_pos_series.append(m_pos)
+                m_pelvis = m_nodes.get("pelvis", {}).get("position", {"x":0,"y":0,"z":0})
+                m_pos_centered = np.array([mp["x"] - m_pelvis["x"], mp["y"] - m_pelvis["y"], mp["z"] - m_pelvis["z"]])
+                master_pos_series.append(m_pos_centered / scale_master)
 
                 mq = m_nodes[joint].get("rotation_quat", m_nodes[joint].get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-                master_rot_series.append(normalize_quaternion_to_euler(mq))
+                qw = mq.get("w", 1.0)
+                if mq.get("x",0) == 0 and mq.get("y",0) == 0 and mq.get("z",0) == 0 and qw == 0: qw = 1.0
+                m_quat = R.from_quat([mq.get("x",0), mq.get("y",0), mq.get("z",0), qw])
+                master_rot_series.append(m_quat.as_euler('xyz', degrees=True))
 
             if not student_pos_series or not master_pos_series:
                 continue
 
-            # Desenvolver ángulos para evitar Gimbal Lock
             student_rot_series = unwrap_euler_series(student_rot_series)
             master_rot_series = unwrap_euler_series(master_rot_series)
 
-            # DTW - Posiciones
             dist_pos, path_pos = fastdtw(master_pos_series, student_pos_series, dist=euclidean)
-            norm_error_pos = dist_pos / len(path_pos)
-
-            # DTW - Rotaciones
             dist_rot, path_rot = fastdtw(master_rot_series, student_rot_series, dist=euclidean)
-            norm_error_rot = dist_rot / len(path_rot)
             
             joint_metrics[joint] = {
-                "pos_error": norm_error_pos,
-                "rot_error": norm_error_rot,
+                "pos_error": dist_pos / len(path_pos),
+                "rot_error": dist_rot / len(path_rot),
                 "path_pos": path_pos,
                 "path_rot": path_rot,
                 "master_pos_series": master_pos_series,
@@ -156,88 +167,104 @@ def evaluate_movement(payload: EvaluationRequest):
         if not joint_metrics:
             raise HTTPException(status_code=400, detail="No se encontraron articulaciones válidas para comparar.")
 
-        # 2. DECISIÓN DE ERROR CRÍTICO (Posición vs Rotación)
-        ROT_THRESHOLD = 15.0 # Grados de tolerancia promedio
-        POS_THRESHOLD = 0.15 # 15% del tamaño del torso como tolerancia
+        # UMBRALES DE TOLERANCIA
+        ROT_THRESHOLD = 15.0 
+        POS_THRESHOLD = 0.15 
         
-        worst_severity = -1.0
-        critical_joint = None
-        error_type = None
+        joints_analysis = {}
+        global_worst_severity = -1.0
+        global_critical_joint = None
 
         for joint, metrics in joint_metrics.items():
             r_sev = metrics["rot_error"] / ROT_THRESHOLD
             p_sev = metrics["pos_error"] / POS_THRESHOLD
             
-            if r_sev > worst_severity:
-                worst_severity = r_sev
-                critical_joint = joint
-                error_type = "rotación"
-                
-            if p_sev > worst_severity:
-                worst_severity = p_sev
-                critical_joint = joint
-                error_type = "trayectoria"
-
-        # Extraer métricas de la peor articulación para el JSON
-        max_angular_dev = joint_metrics[critical_joint]["rot_error"]
-        max_positional_dev = joint_metrics[critical_joint]["pos_error"]
-
-        # 3. ENCONTRAR EL MOMENTO EXACTO DE LA FALLA
-        c_metrics = joint_metrics[critical_joint]
-        if error_type == "rotación":
-            worst_idx = find_worst_moment(c_metrics["master_rot_series"], c_metrics["student_rot_series"], c_metrics["path_rot"])
-        else:
-            worst_idx = find_worst_moment(c_metrics["master_pos_series"], c_metrics["student_pos_series"], c_metrics["path_pos"])
-
-        total_student_frames = len(user_frames)
-        worst_frame_data = user_frames[worst_idx]
-        
-        # Datos exactos para Unreal Engine 5
-        frame_num = worst_frame_data.get("frame", worst_idx)
-        time_sec = worst_frame_data.get("time_sec", 0.0)
-        percentage_execution = round((worst_idx / max(1, total_student_frames - 1)) * 100, 2)
-
-        # 4. GENERACIÓN DEL FEEDBACK INTELIGENTE
-        if percentage_execution < 33.3:
-            fase_texto = "al inicio del movimiento (fase de preparación)"
-        elif percentage_execution < 66.6:
-            fase_texto = "a la mitad del movimiento (fase de ejecución)"
-        else:
-            fase_texto = "al final del movimiento (fase de impacto/recuperación)"
-
-        traduccion = {
-            "head": "cabeza",
-            "hand_r": "mano derecha",
-            "hand_l": "mano izquierda",
-            "foot_r": "pie derecho",
-            "foot_l": "pie izquierdo"
-        }
-        falla_legible = traduccion.get(critical_joint, critical_joint)
-
-        passed = worst_severity <= 1.0  # Menor a 1.0 significa que no superó los umbrales
-        score_general = max(0.0, 100.0 - (worst_severity * 20.0))
-
-        if passed:
-            feedback = "¡Técnica excelente! Movimiento y rotación correctos."
-        else:
-            if error_type == "rotación":
-                feedback = f"Técnica incorrecta en la {falla_legible}. Tu error principal fue en el giro o rotación de la articulación, ocurriendo específicamente {fase_texto}."
+            worst_joint_severity = max(r_sev, p_sev)
+            passed = worst_joint_severity <= 1.0
+            
+            if r_sev > p_sev:
+                failure_type = "rotación" if not passed else "ninguno"
+                worst_idx = find_worst_moment(metrics["master_rot_series"], metrics["student_rot_series"], metrics["path_rot"])
             else:
-                feedback = f"Técnica incorrecta en la {falla_legible}. La trayectoria se desvió demasiado del maestro, y el mayor error ocurrió {fase_texto}."
+                failure_type = "trayectoria" if not passed else "ninguno"
+                worst_idx = find_worst_moment(metrics["master_pos_series"], metrics["student_pos_series"], metrics["path_pos"])
+                
+            frame_data = user_frames[worst_idx]
+            frame_num = frame_data.get("frame", worst_idx)
+            time_sec = frame_data.get("time_sec", 0.0)
+            percentage = (worst_idx / max(1, len(user_frames) - 1)) * 100
+            
+            joints_analysis[joint] = {
+                "passed": passed,
+                "max_angular_deviation": round(metrics["rot_error"], 2),
+                "max_positional_deviation": round(metrics["pos_error"], 2),
+                "failure_type": failure_type,
+                "error_percentage_execution": round(percentage, 2),
+                "error_frame_exact": frame_num,
+                "error_time_sec": round(time_sec, 4)
+            }
+            
+            if worst_joint_severity > global_worst_severity:
+                global_worst_severity = worst_joint_severity
+                global_critical_joint = joint
+
+        global_passed = global_worst_severity <= 1.0
+        score_general = max(0.0, 100.0 - (global_worst_severity * 20.0))
+        
+        # GENERACIÓN DEL TEXTO COMPUESTO
+        traduccion = {
+            "head": "la cabeza", "hand_r": "la mano derecha", "hand_l": "la mano izquierda", 
+            "foot_r": "el pie derecho", "foot_l": "el pie izquierdo"
+        }
+        
+        if global_passed:
+            feedback = "¡Técnica excelente! Movimiento y posturas correctos."
+        else:
+            c_joint_data = joints_analysis[global_critical_joint]
+            c_name = traduccion.get(global_critical_joint, global_critical_joint)
+            c_type = c_joint_data["failure_type"]
+            c_perc = c_joint_data["error_percentage_execution"]
+            
+            if c_perc < 33.3: fase = "al inicio del movimiento"
+            elif c_perc < 66.6: fase = "a la mitad del movimiento"
+            else: fase = "al final del movimiento"
+            
+            feedback = f"Técnica incorrecta. Tu principal problema fue el error de {c_type} en {c_name} {fase}."
+            
+            secondary_errors = []
+            for j, data in joints_analysis.items():
+                if j != global_critical_joint and not data["passed"]:
+                    s_name = traduccion.get(j, j)
+                    s_type = data["failure_type"]
+                    s_perc = data["error_percentage_execution"]
+                    if s_perc < 33.3: s_fase = "al inicio"
+                    elif s_perc < 66.6: s_fase = "a la mitad"
+                    else: s_fase = "al final"
+                    secondary_errors.append(f"{s_type} en {s_name} {s_fase}")
+            
+            if secondary_errors:
+                if len(secondary_errors) == 1:
+                    feedback += f" Además, notamos un error de {secondary_errors[0]}."
+                else:
+                    feedback += " Adicionalmente fallaron: " + ", ".join(secondary_errors) + "."
+                    
+            good_joints = [traduccion.get(j, j) for j, data in joints_analysis.items() if data["passed"]]
+            if good_joints:
+                if len(good_joints) == 1:
+                    feedback += f" Por otro lado, {good_joints[0]} se ejecutó bien."
+                else:
+                    last = good_joints.pop() if len(good_joints) > 1 else ""
+                    good_str = ", ".join(good_joints) + " y " + last if last else good_joints[0]
+                    feedback += f" Por otro lado, ejecutaste bien: {good_str}."
 
         return {
             "success": True,
             "score": round(score_general, 2),
             "feedback": feedback,
             "detailed_metrics": {
-                "max_angular_deviation": round(max_angular_dev, 2),
-                "max_positional_deviation": round(max_positional_dev, 2),
-                "critical_failure_joint": critical_joint,
-                "critical_failure_type": error_type,
-                "error_percentage_execution": percentage_execution,
-                "error_frame_exact": frame_num,
-                "error_time_sec": round(time_sec, 4),
-                "passed": passed
+                "global_passed": global_passed,
+                "critical_failure_joint": global_critical_joint,
+                "joints_analysis": joints_analysis
             }
         }
 
