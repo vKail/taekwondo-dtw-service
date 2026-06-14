@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import numpy as np
-from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
+from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation as R
 
 app = FastAPI(title="Taekwondo Biomechanics Evaluator")
@@ -35,63 +34,134 @@ def extract_yaw_from_quat(quat_dict: dict) -> float:
     return euler[0] 
 
 def calculate_spatial_alignment(student_frames, master_frames) -> R:
-    """Calcula la matriz de rotación en Z usando la PELVIS como origen direccional."""
+    """Calcula la matriz de rotación en Z usando la POSICIÓN de los pies como origen direccional."""
     try:
-        u_pelvis_0 = student_frames[0].get("trackers", student_frames[0].get("bones", {})).get("pelvis", {})
-        m_pelvis_0 = master_frames[0].get("trackers", master_frames[0].get("bones", {})).get("pelvis", {})
+        u_nodes_0 = student_frames[0].get("trackers", student_frames[0].get("bones", {}))
+        m_nodes_0 = master_frames[0].get("trackers", master_frames[0].get("bones", {}))
         
-        uq = u_pelvis_0.get("rotation_quat", u_pelvis_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-        mq = m_pelvis_0.get("rotation_quat", m_pelvis_0.get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
+        u_foot_r = u_nodes_0.get("foot_r", {}).get("position", {"x":0,"y":0,"z":0})
+        u_foot_l = u_nodes_0.get("foot_l", {}).get("position", {"x":0,"y":0,"z":0})
         
-        u_yaw = extract_yaw_from_quat(uq)
-        m_yaw = extract_yaw_from_quat(mq)
+        m_foot_r = m_nodes_0.get("foot_r", {}).get("position", {"x":0,"y":0,"z":0})
+        m_foot_l = m_nodes_0.get("foot_l", {}).get("position", {"x":0,"y":0,"z":0})
+        
+        u_vec_x = u_foot_r["x"] - u_foot_l["x"]
+        u_vec_y = u_foot_r["y"] - u_foot_l["y"]
+        
+        m_vec_x = m_foot_r["x"] - m_foot_l["x"]
+        m_vec_y = m_foot_r["y"] - m_foot_l["y"]
+        
+        u_yaw = np.arctan2(u_vec_y, u_vec_x)
+        m_yaw = np.arctan2(m_vec_y, m_vec_x)
         
         delta_yaw = m_yaw - u_yaw
         return R.from_euler('z', delta_yaw, degrees=False)
     except Exception:
         return R.from_euler('z', 0, degrees=False)
 
-def quat_angular_distance(q1, q2):
+def subsequence_dtw(master_series, student_series, mode="pos"):
     """
-    Calcula la distancia angular más corta en grados absolutos entre dos cuaterniones.
-    Evita el 'Aliasing' y el 'Gimbal Lock' de los Ángulos de Euler.
+    Subsequence DTW vectorizado parcialmente para máxima velocidad.
+    Encuentra la mejor ventana del maestro dentro de una grabación más larga del estudiante.
+    mode puede ser "pos" (euclidean) o "rot" (quat_angular_distance vectorizado).
     """
-    dot_product = np.dot(q1, q2)
-    dot_product = np.clip(np.abs(dot_product), 0.0, 1.0)
-    return np.degrees(2 * np.arccos(dot_product))
+    X = np.array(master_series)
+    Y = np.array(student_series)
+    
+    if mode == "pos":
+        C = cdist(X, Y, metric='euclidean')
+    else:
+        dot_products = np.clip(np.abs(np.dot(X, Y.T)), 0.0, 1.0)
+        C = np.degrees(2 * np.arccos(dot_products))
+        
+    N, M = C.shape
+    D = np.zeros((N, M))
+    D[0, :] = C[0, :]
+    for i in range(1, N):
+        D[i, 0] = D[i-1, 0] + C[i, 0]
+        
+    for i in range(1, N):
+        for j in range(1, M):
+            c1 = D[i-1, j-1]
+            c2 = D[i-1, j]
+            c3 = D[i, j-1]
+            min_c = c1
+            if c2 < min_c: min_c = c2
+            if c3 < min_c: min_c = c3
+            D[i, j] = C[i, j] + min_c
+            
+    j_end = int(np.argmin(D[-1, :]))
+    min_cost = float(D[-1, j_end])
+    
+    path = []
+    i = N - 1
+    j = j_end
+    path.append((i, j))
+    while i > 0:
+        if j == 0:
+            i -= 1
+        else:
+            c1 = D[i-1, j-1]
+            c2 = D[i-1, j]
+            c3 = D[i, j-1]
+            if c1 <= c2 and c1 <= c3:
+                i, j = i-1, j-1
+            elif c2 <= c1 and c2 <= c3:
+                i, j = i-1, j
+            else:
+                i, j = i, j-1
+        path.append((i, j))
+        
+    path.reverse()
+    return min_cost, path
 
 def extract_nodes(frame: dict) -> dict:
     return frame.get("trackers", frame.get("bones", {}))
 
 def get_joint_keys_for_movement(movement_type: str) -> list:
-    """Excluimos la cabeza de la evaluación por ser irrelevante biomecánicamente en Taekwondo."""
-    mov = movement_type.lower()
-    if mov == "jirugi":
+    """Selecciona las articulaciones a evaluar según la técnica de la tesis."""
+    mov = movement_type.lower().strip()
+    
+    # Técnicas de Mano
+    if mov in ["jirugi", "palgup chigi", "palgup_chigi"]:
         return ["hand_r", "hand_l"]
-    elif mov in ["ap_chagi", "dollyo_chagi", "yop_chagi", "chagi"]:
+        
+    # Técnicas de Pie (Patadas)
+    elif mov in ["ap chagi", "ap_chagi", "dollyo chagi", "dollyo_chagi", 
+                 "yop chagi", "yop_chagi", "naeryo chagi", "naeryo_chagi",
+                 "bandal chagi", "bandal_chagi", "mireo chagi", "mireo_chagi", "chagi"]:
         return ["foot_r", "foot_l"]
+        
+    # Por defecto evalúa extremidades
     else:
         return ["hand_r", "hand_l", "foot_r", "foot_l"]
 
 def find_worst_moment_pos(master_series, student_series, path):
     max_d = -1.0
-    worst_student_idx = 0
+    w_m, w_s = 0, 0
     for i, j in path:
-        d = euclidean(master_series[i], student_series[j])
+        d = np.linalg.norm(np.array(master_series[i]) - np.array(student_series[j]))
         if d > max_d:
             max_d = d
-            worst_student_idx = j
-    return worst_student_idx
+            w_m, w_s = i, j
+    return w_m, w_s
 
 def find_worst_moment_rot(master_series, student_series, path):
     max_d = -1.0
-    worst_student_idx = 0
+    w_m, w_s = 0, 0
     for i, j in path:
-        d = quat_angular_distance(master_series[i], student_series[j])
+        dp = np.clip(np.abs(np.dot(master_series[i], student_series[j])), 0.0, 1.0)
+        d = np.degrees(2 * np.arccos(dp))
         if d > max_d:
             max_d = d
-            worst_student_idx = j
-    return worst_student_idx
+            w_m, w_s = i, j
+    return w_m, w_s
+
+def safe_quat(q_dict):
+    x, y, z, w = q_dict.get("x", 0.0), q_dict.get("y", 0.0), q_dict.get("z", 0.0), q_dict.get("w", 1.0)
+    if x == 0 and y == 0 and z == 0 and w == 0:
+        w = 1.0
+    return R.from_quat([x, y, z, w])
 
 @app.post("/evaluate")
 def evaluate_movement(payload: EvaluationRequest):
@@ -120,6 +190,17 @@ def evaluate_movement(payload: EvaluationRequest):
             master_rot_series = []
             student_rot_series = []
 
+            # Extraer rotación inicial de la articulación para cálculo relativo
+            u_nodes_0 = extract_nodes(user_frames[0])
+            u_quat_0 = R.from_quat([0,0,0,1])
+            if joint in u_nodes_0:
+                u_quat_0 = safe_quat(u_nodes_0[joint].get("rotation_quat", u_nodes_0[joint].get("rotation_quaternion", {})))
+                
+            m_nodes_0 = extract_nodes(master_frames[0])
+            m_quat_0 = R.from_quat([0,0,0,1])
+            if joint in m_nodes_0:
+                m_quat_0 = safe_quat(m_nodes_0[joint].get("rotation_quat", m_nodes_0[joint].get("rotation_quaternion", {})))
+
             for u_frame in user_frames:
                 u_nodes = extract_nodes(u_frame)
                 if joint not in u_nodes: continue
@@ -133,14 +214,12 @@ def evaluate_movement(payload: EvaluationRequest):
                 u_pos_aligned = alignment_rot.apply(u_pos_centered)
                 student_pos_series.append(u_pos_aligned / scale_user)
 
-                uq = u_nodes[joint].get("rotation_quat", u_nodes[joint].get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-                qw = uq.get("w", 1.0)
-                if uq.get("x",0) == 0 and uq.get("y",0) == 0 and uq.get("z",0) == 0 and qw == 0: qw = 1.0
+                uq_dict = u_nodes[joint].get("rotation_quat", u_nodes[joint].get("rotation_quaternion", {}))
+                u_quat = safe_quat(uq_dict)
                 
-                # Alinear la rotación de la articulación con el mundo
-                u_quat = R.from_quat([uq.get("x",0), uq.get("y",0), uq.get("z",0), qw])
-                aligned_u_quat = alignment_rot * u_quat
-                student_rot_series.append(aligned_u_quat.as_quat()) # Usamos as_quat, que devuelve numpy array [x,y,z,w]
+                # Rotación RELATIVA desde el frame 0
+                rel_u_quat = u_quat_0.inv() * u_quat
+                student_rot_series.append(rel_u_quat.as_quat()) # Usamos as_quat, que devuelve numpy array [x,y,z,w]
 
             for m_frame in master_frames:
                 m_nodes = extract_nodes(m_frame)
@@ -151,19 +230,19 @@ def evaluate_movement(payload: EvaluationRequest):
                 m_pos_centered = np.array([mp["x"] - m_pelvis["x"], mp["y"] - m_pelvis["y"], mp["z"] - m_pelvis["z"]])
                 master_pos_series.append(m_pos_centered / scale_master)
 
-                mq = m_nodes[joint].get("rotation_quat", m_nodes[joint].get("rotation_quaternion", {"x":0,"y":0,"z":0,"w":1}))
-                qw = mq.get("w", 1.0)
-                if mq.get("x",0) == 0 and mq.get("y",0) == 0 and mq.get("z",0) == 0 and qw == 0: qw = 1.0
+                mq_dict = m_nodes[joint].get("rotation_quat", m_nodes[joint].get("rotation_quaternion", {}))
+                m_quat = safe_quat(mq_dict)
                 
-                m_quat = R.from_quat([mq.get("x",0), mq.get("y",0), mq.get("z",0), qw])
-                master_rot_series.append(m_quat.as_quat())
+                # Rotación RELATIVA desde el frame 0
+                rel_m_quat = m_quat_0.inv() * m_quat
+                master_rot_series.append(rel_m_quat.as_quat())
 
             if not student_pos_series or not master_pos_series:
                 continue
 
-            # Ya NO usamos euler unwrap. DTW puro con cuaterniones.
-            dist_pos, path_pos = fastdtw(master_pos_series, student_pos_series, dist=euclidean)
-            dist_rot, path_rot = fastdtw(master_rot_series, student_rot_series, dist=quat_angular_distance)
+            # Usar Subsequence DTW en lugar de Global DTW
+            dist_pos, path_pos = subsequence_dtw(master_pos_series, student_pos_series, mode="pos")
+            dist_rot, path_rot = subsequence_dtw(master_rot_series, student_rot_series, mode="rot")
             
             joint_metrics[joint] = {
                 "pos_error": dist_pos / len(path_pos),
@@ -180,8 +259,8 @@ def evaluate_movement(payload: EvaluationRequest):
             raise HTTPException(status_code=400, detail="No se encontraron articulaciones válidas para comparar.")
 
         # UMBRALES DE TOLERANCIA
-        ROT_THRESHOLD = 20.0 # 20 Grados de rotación absoluta pura
-        POS_THRESHOLD = 0.15 
+        ROT_THRESHOLD = 45.0 # 45 Grados de desviación permitida para trackers de VR
+        POS_THRESHOLD = 0.40 # 40% de la longitud del torso (Mayor holgura por limitaciones físicas/trackers)
         
         joints_analysis = {}
         global_worst_severity = -1.0
@@ -196,21 +275,49 @@ def evaluate_movement(payload: EvaluationRequest):
             
             if r_sev > p_sev:
                 failure_type = "rotación" if not passed else "ninguno"
-                worst_idx = find_worst_moment_rot(metrics["master_rot_series"], metrics["student_rot_series"], metrics["path_rot"])
+                w_m, w_s = find_worst_moment_rot(metrics["master_rot_series"], metrics["student_rot_series"], metrics["path_rot"])
+                diagnostic = ""
             else:
                 failure_type = "trayectoria" if not passed else "ninguno"
-                worst_idx = find_worst_moment_pos(metrics["master_pos_series"], metrics["student_pos_series"], metrics["path_pos"])
+                w_m, w_s = find_worst_moment_pos(metrics["master_pos_series"], metrics["student_pos_series"], metrics["path_pos"])
                 
-            frame_data = user_frames[worst_idx]
-            frame_num = frame_data.get("frame", worst_idx)
+                diagnostic = ""
+                if not passed:
+                    m_pos = metrics["master_pos_series"][w_m]
+                    s_pos = metrics["student_pos_series"][w_s]
+                    diff = s_pos - m_pos
+                    
+                    detalles = []
+                    # Z (Altura)
+                    if diff[2] > 0.15: detalles.append("muy alta")
+                    elif diff[2] < -0.15: detalles.append("muy baja")
+                    
+                    # Y (Profundidad) asumiendo +Y adelante
+                    if diff[1] > 0.15: detalles.append("muy estirada al frente")
+                    elif diff[1] < -0.15: detalles.append("muy recogida hacia el cuerpo")
+                    
+                    # X (Apertura)
+                    if joint in ["hand_r", "foot_r"]:
+                        if diff[0] < -0.15: detalles.append("muy abierta hacia afuera")
+                        elif diff[0] > 0.15: detalles.append("cruzada hacia adentro")
+                    else:
+                        if diff[0] > 0.15: detalles.append("muy abierta hacia afuera")
+                        elif diff[0] < -0.15: detalles.append("cruzada hacia adentro")
+                        
+                    if detalles:
+                        diagnostic = " (específicamente: " + ", ".join(detalles) + ")"
+                
+            frame_data = user_frames[w_s]
+            frame_num = frame_data.get("frame", w_s)
             time_sec = frame_data.get("time_sec", 0.0)
-            percentage = (worst_idx / max(1, len(user_frames) - 1)) * 100
+            percentage = (w_s / max(1, len(user_frames) - 1)) * 100
             
             joints_analysis[joint] = {
                 "passed": passed,
                 "max_angular_deviation": round(metrics["rot_error"], 2),
                 "max_positional_deviation": round(metrics["pos_error"], 2),
                 "failure_type": failure_type,
+                "diagnostic": diagnostic,
                 "error_percentage_execution": round(percentage, 2),
                 "error_frame_exact": frame_num,
                 "error_time_sec": round(time_sec, 4)
@@ -221,7 +328,20 @@ def evaluate_movement(payload: EvaluationRequest):
                 global_critical_joint = joint
 
         global_passed = global_worst_severity <= 1.0
-        score_general = max(0.0, 100.0 - (global_worst_severity * 20.0))
+        
+        # Sistema de Puntuación Académico Segmentado (Aún más flexible)
+        if global_worst_severity <= 1.0:
+            # 0.0 a 1.0 -> 100 a 90 (Excelente)
+            score_general = 100.0 - (global_worst_severity * 10.0)
+        elif global_worst_severity <= 2.0:
+            # 1.0 a 2.0 -> 90 a 75 (Bueno, con errores de hardware / menores)
+            score_general = 90.0 - ((global_worst_severity - 1.0) * 15.0)
+        elif global_worst_severity <= 3.0:
+            # 2.0 a 3.0 -> 75 a 60 (Aceptable con observaciones)
+            score_general = 75.0 - ((global_worst_severity - 2.0) * 15.0)
+        else:
+            # > 3.0 -> 60 a 0 (Técnica deficiente)
+            score_general = max(0.0, 60.0 - ((global_worst_severity - 3.0) * 10.0))
         
         # GENERACIÓN DEL TEXTO COMPUESTO
         traduccion = {
@@ -230,18 +350,23 @@ def evaluate_movement(payload: EvaluationRequest):
         }
         
         if global_passed:
-            feedback = "¡Técnica excelente! Movimiento y posturas correctos."
+            if score_general >= 90:
+                feedback = f"¡Técnica Excelente! Puntuación: {score_general:.1f}/100. Movimiento y posturas correctos."
+            else:
+                feedback = f"¡Buena Ejecución! Puntuación: {score_general:.1f}/100. Pasaste la prueba, pero tienes detalles menores."
         else:
             c_joint_data = joints_analysis[global_critical_joint]
             c_name = traduccion.get(global_critical_joint, global_critical_joint)
             c_type = c_joint_data["failure_type"]
             c_perc = c_joint_data["error_percentage_execution"]
+            c_diag = c_joint_data.get("diagnostic", "")
             
             if c_perc < 33.3: fase = "al inicio del movimiento"
             elif c_perc < 66.6: fase = "a la mitad del movimiento"
             else: fase = "al final del movimiento"
             
-            feedback = f"Técnica incorrecta. Tu principal problema fue el error de {c_type} en {c_name} {fase}."
+            falla_desc = "un giro incorrecto del ángulo" if c_type == "rotación" else f"una posición incorrecta{c_diag}"
+            feedback = f"Puntuación: {score_general:.1f}/100. Necesitas mejorar. Tu principal problema fue {falla_desc} en {c_name} {fase}."
             
             secondary_errors = []
             for j, data in joints_analysis.items():
@@ -249,10 +374,14 @@ def evaluate_movement(payload: EvaluationRequest):
                     s_name = traduccion.get(j, j)
                     s_type = data["failure_type"]
                     s_perc = data["error_percentage_execution"]
+                    s_diag = data.get("diagnostic", "")
+                    
                     if s_perc < 33.3: s_fase = "al inicio"
                     elif s_perc < 66.6: s_fase = "a la mitad"
                     else: s_fase = "al final"
-                    secondary_errors.append(f"{s_type} en {s_name} {s_fase}")
+                    
+                    s_falla = "giro incorrecto" if s_type == "rotación" else f"posición incorrecta{s_diag}"
+                    secondary_errors.append(f"{s_falla} en {s_name} {s_fase}")
             
             if secondary_errors:
                 if len(secondary_errors) == 1:
