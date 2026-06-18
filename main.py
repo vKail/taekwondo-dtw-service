@@ -175,11 +175,27 @@ def safe_quat(q_dict):
 def evaluate_movement(payload: EvaluationRequest):
     start_time = time.time()
     request_id = str(uuid.uuid4())
+    
+    logger.info(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "comparison_started",
+        "requestId": request_id,
+        "inputSizeA": len(payload.master_data.get("frames", [])),
+        "inputSizeB": len(payload.user_data.get("frames", []))
+    }))
+    
     try:
         user_frames = payload.user_data.get("frames", [])
         master_frames = payload.master_data.get("frames", [])
 
         if not user_frames or not master_frames:
+            logger.warning(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": "invalid_payload",
+                "requestId": request_id,
+                "status": "error",
+                "message": "Los datos deben contener 'frames'."
+            }))
             raise HTTPException(status_code=400, detail="Los datos deben contener 'frames'.")
 
         u_nodes_0 = extract_nodes(user_frames[0])
@@ -414,14 +430,15 @@ def evaluate_movement(payload: EvaluationRequest):
         # Generar log estructurado
         log_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": "dtw_evaluation_executed",
+            "event": "comparison_finished",
             "requestId": request_id,
             "algorithm": "subsequence-dtw-biomechanics-v1",
             "durationMs": duration_ms,
             "inputSizeA": len(master_frames),
             "inputSizeB": len(user_frames),
             "similarity": round(score_general / 100.0, 2), # Escala de 0 a 1 como en el ejemplo
-            "differencesCount": differences_count
+            "differencesCount": differences_count,
+            "status": "success"
         }
         logger.info(json.dumps(log_data))
 
@@ -438,21 +455,24 @@ def evaluate_movement(payload: EvaluationRequest):
 
     except HTTPException as e:
         duration_ms = round((time.time() - start_time) * 1000, 2)
-        logger.error(json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": "dtw_evaluation_error",
-            "requestId": request_id,
-            "durationMs": duration_ms,
-            "error": str(e.detail)
-        }))
+        if e.status_code != 400: # 400 is already logged as invalid_payload
+            logger.error(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": "comparison_error",
+                "requestId": request_id,
+                "durationMs": duration_ms,
+                "status": "error",
+                "errorMessage": str(e.detail)
+            }))
         raise
     except Exception as e:
         duration_ms = round((time.time() - start_time) * 1000, 2)
         logger.error(json.dumps({
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": "dtw_evaluation_error",
+            "event": "comparison_error",
             "requestId": request_id,
             "durationMs": duration_ms,
-            "error": str(e)
+            "status": "error",
+            "errorMessage": str(e)
         }))
         raise HTTPException(status_code=500, detail=str(e))
