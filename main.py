@@ -3,6 +3,14 @@ from pydantic import BaseModel
 import numpy as np
 from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation as R
+import time
+import logging
+import uuid
+import json
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger("dtw_evaluator")
 
 app = FastAPI(title="Taekwondo Biomechanics Evaluator")
 
@@ -165,6 +173,8 @@ def safe_quat(q_dict):
 
 @app.post("/evaluate")
 def evaluate_movement(payload: EvaluationRequest):
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
     try:
         user_frames = payload.user_data.get("frames", [])
         master_frames = payload.master_data.get("frames", [])
@@ -398,6 +408,23 @@ def evaluate_movement(payload: EvaluationRequest):
                     good_str = ", ".join(good_joints) + " y " + last if last else good_joints[0]
                     feedback += f" Por otro lado, ejecutaste bien: {good_str}."
 
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        differences_count = sum(1 for data in joints_analysis.values() if not data["passed"])
+        
+        # Generar log estructurado
+        log_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "dtw_evaluation_executed",
+            "requestId": request_id,
+            "algorithm": "subsequence-dtw-biomechanics-v1",
+            "durationMs": duration_ms,
+            "inputSizeA": len(master_frames),
+            "inputSizeB": len(user_frames),
+            "similarity": round(score_general / 100.0, 2), # Escala de 0 a 1 como en el ejemplo
+            "differencesCount": differences_count
+        }
+        logger.info(json.dumps(log_data))
+
         return {
             "success": True,
             "score": round(score_general, 2),
@@ -409,7 +436,23 @@ def evaluate_movement(payload: EvaluationRequest):
             }
         }
 
-    except HTTPException:
+    except HTTPException as e:
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        logger.error(json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "dtw_evaluation_error",
+            "requestId": request_id,
+            "durationMs": duration_ms,
+            "error": str(e.detail)
+        }))
         raise
     except Exception as e:
+        duration_ms = round((time.time() - start_time) * 1000, 2)
+        logger.error(json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "dtw_evaluation_error",
+            "requestId": request_id,
+            "durationMs": duration_ms,
+            "error": str(e)
+        }))
         raise HTTPException(status_code=500, detail=str(e))
